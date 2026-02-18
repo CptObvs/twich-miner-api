@@ -40,6 +40,18 @@ class Settings(BaseSettings):
 
     # Log streaming
     LOG_HISTORY_LINES: int = 100
+    OUTPUT_LOG_MAX_SIZE_BYTES: int = 2 * 1024 * 1024
+
+    # Memory / scalability
+    MEMORY_GC_ENABLED: bool = True
+    MEMORY_GC_INTERVAL_SECONDS: int = 300
+    MEMORY_GC_GENERATION: int = 2
+
+    # Request logging
+    API_REQUEST_LOGGING_ENABLED: bool = True
+
+    # Startup behavior
+    RUN_MIGRATIONS_ON_STARTUP: bool = True
 
     # Instance limits
     MAX_INSTANCES_PER_USER: int = 2  # Maximum instances for "user" role

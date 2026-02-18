@@ -1,9 +1,10 @@
 import json
 import shutil
 import asyncio
+import logging
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,14 +15,22 @@ from app.models.enums import InstanceState
 from app.models.schemas import InstanceCreate, InstanceResponse, InstanceStatus, StreamersUpdate
 from app.services.auth import get_current_user
 from app.services.miner_manager import miner_manager
-from app.services.log_streamer import tail_log
+from app.services.log_streamer import tail_log, get_instance_log_file
 
 router = APIRouter(prefix="/instances", tags=["instances"])
+logger = logging.getLogger("uvicorn.error")
+
+def _empty_activation() -> dict[str, str | None]:
+    return {"activation_url": None, "activation_code": None}
 
 
-# ------------------------------------------------------------------
-# Helpers
-# ------------------------------------------------------------------
+async def _stop_instance_with_db(instance_id: str, db: AsyncSession) -> bool:
+    try:
+        return await miner_manager.stop(instance_id, db_session=db)
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        return await miner_manager.stop(instance_id)
 
 async def _get_user_instance(
     instance_id: str,
@@ -79,9 +88,20 @@ def _instance_to_response(instance: MinerInstance) -> InstanceResponse:
     )
 
 
-# ------------------------------------------------------------------
-# CRUD
-# ------------------------------------------------------------------
+async def _count_running_instances_for_user(
+    db: AsyncSession,
+    user_id: str,
+    exclude_instance_id: str,
+) -> int:
+    result = await db.execute(
+        select(MinerInstance).where(
+            MinerInstance.user_id == user_id,
+            MinerInstance.status == InstanceState.RUNNING,
+        )
+    )
+    running_instances = result.scalars().all()
+    return len([instance for instance in running_instances if instance.id != exclude_instance_id])
+
 
 @router.post("/", response_model=InstanceResponse, status_code=201)
 async def create_instance(
@@ -90,7 +110,6 @@ async def create_instance(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Create a new miner instance (does NOT start it yet)."""
-    # Check instance limit for non-admin users
     if not current_user.is_admin():
         result = await db.execute(
             select(MinerInstance).where(MinerInstance.user_id == current_user.id)
@@ -111,6 +130,13 @@ async def create_instance(
         "twitch_username": data.twitch_username,
         "streamers": data.streamers,
     })
+
+    logger.info(
+        "Instanz erstellt: id=%s, user_id=%s, twitch_username=%s",
+        instance.id,
+        current_user.id,
+        data.twitch_username,
+    )
 
     return _instance_to_response(instance)
 
@@ -157,9 +183,9 @@ async def delete_instance(
     """Delete a miner instance. Stops it first if it is still running."""
     instance = await _get_user_instance(instance_id, current_user, db)
 
-    # Stop the process if it is running
-    if miner_manager.is_process_tracked(instance_id):
-        await miner_manager.stop(instance_id)
+    if instance.status != InstanceState.STOPPED:
+        logger.info("Instanz wird vor Löschung gestoppt: id=%s", instance_id)
+        await _stop_instance_with_db(instance_id, db)
 
     # Remove instance directory (config, logs, cookies, run.py, …)
     instance_dir = settings.INSTANCES_DIR / instance_id
@@ -169,11 +195,8 @@ async def delete_instance(
     # Remove from database
     await db.delete(instance)
     await db.commit()
+    logger.info("Instanz gelöscht: id=%s, user_id=%s", instance_id, current_user.id)
 
-
-# ------------------------------------------------------------------
-# Update streamers
-# ------------------------------------------------------------------
 
 @router.put("/{instance_id}/streamers", response_model=InstanceResponse)
 async def update_streamers(
@@ -193,12 +216,14 @@ async def update_streamers(
     config["streamers"] = data.streamers
     _write_config(instance_id, config)
 
+    logger.info(
+        "Streamer aktualisiert: id=%s, anzahl=%s",
+        instance_id,
+        len(data.streamers),
+    )
+
     return _instance_to_response(instance)
 
-
-# ------------------------------------------------------------------
-# Start / Stop
-# ------------------------------------------------------------------
 
 @router.post("/{instance_id}/start", response_model=InstanceStatus)
 async def start_instance(
@@ -208,18 +233,13 @@ async def start_instance(
 ):
     """Start a miner instance."""
 
-    # Maximal 2 laufende Instanzen pro User (außer Admin)
     instance = await _get_user_instance(instance_id, current_user, db)
     if not current_user.is_admin():
-        result = await db.execute(
-            select(MinerInstance).where(
-                MinerInstance.user_id == current_user.id,
-                MinerInstance.status == InstanceState.RUNNING
-            )
+        running_count = await _count_running_instances_for_user(
+            db,
+            user_id=current_user.id,
+            exclude_instance_id=instance_id,
         )
-        running_instances = result.scalars().all()
-        # Zähle alle laufenden Instanzen außer die aktuelle (falls Restart)
-        running_count = len([i for i in running_instances if i.id != instance_id])
         if running_count >= 2:
             raise HTTPException(
                 400,
@@ -238,21 +258,24 @@ async def start_instance(
         )
 
     try:
+        logger.info("Start angefordert: id=%s, user_id=%s", instance_id, current_user.id)
         pid = await miner_manager.start(
             instance_id=instance_id,
             twitch_username=config["twitch_username"],
             streamers=config["streamers"],
+            db_session=db,
         )
     except RuntimeError as e:
+        logger.warning("Start abgelehnt: id=%s, grund=%s", instance_id, str(e))
         raise HTTPException(409, str(e))
 
-    # Give the miner a short moment to flush initial activation lines to output.log
     await asyncio.sleep(1)
 
-    # Nach dem Start: Logdatei nach Twitch-Activation durchsuchen
     from app.services.activation_log_parser import extract_twitch_activation
-    log_path = settings.INSTANCES_DIR / instance_id / "logs" / "output.log"
-    activation = extract_twitch_activation(log_path, lines=10)
+    log_path = get_instance_log_file(instance_id)
+    activation = extract_twitch_activation(log_path, lines=10) if log_path else _empty_activation()
+
+    logger.info("Instanz gestartet: id=%s, pid=%s", instance_id, pid)
 
     return InstanceStatus(
         id=instance_id,
@@ -282,13 +305,16 @@ async def stop_instance(
     """
     instance = await _get_user_instance(instance_id, current_user, db)
 
-    stopped = await miner_manager.stop(instance_id)
+    logger.info("Stop angefordert: id=%s, user_id=%s", instance_id, current_user.id)
+    stopped = await _stop_instance_with_db(instance_id, db)
     if not stopped:
-        # Instance was not running - ensure DB is in sync
         if instance.status != InstanceState.STOPPED:
             instance.status = InstanceState.STOPPED
             instance.pid = None
             await db.commit()
+        logger.info("Instanz war bereits gestoppt: id=%s", instance_id)
+    else:
+        logger.info("Instanz gestoppt: id=%s", instance_id)
 
     return InstanceStatus(id=instance_id, status=InstanceState.STOPPED, pid=None)
 
@@ -300,15 +326,8 @@ async def instance_status(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Check if a miner instance is running."""
+    await miner_manager.reconcile_instance_status(instance_id, db_session=db)
     instance = await _get_user_instance(instance_id, current_user, db)
-
-    # Check if DB says RUNNING but process is not actually tracked
-    if instance.status == InstanceState.RUNNING and not miner_manager.is_process_tracked(instance_id):
-        # Process died/crashed - update DB to reflect reality
-        instance.status = InstanceState.STOPPED
-        instance.pid = None
-        await db.commit()
-        await db.refresh(instance)
 
     return InstanceStatus(
         id=instance_id,
@@ -316,12 +335,6 @@ async def instance_status(
         pid=instance.pid,
     )
 
-
-# ------------------------------------------------------------------
-# SSE: Live log streaming
-# ------------------------------------------------------------------
-
-from fastapi import Query
 
 @router.get("/{instance_id}/logs")
 async def stream_logs(
@@ -342,6 +355,7 @@ async def stream_logs(
            then read response.body as stream
     """
     await _get_user_instance(instance_id, current_user, db)
+    logger.info("Log-Stream geöffnet: id=%s, user_id=%s", instance_id, current_user.id)
 
     async def event_generator():
         async for line in tail_log(instance_id, history_lines=history_lines):

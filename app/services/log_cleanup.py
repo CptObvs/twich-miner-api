@@ -17,9 +17,40 @@ class LogCleanupManager:
     """Manages log file cleanup and rotation for miner instances."""
 
     # Configuration
-    MAX_LOG_FILE_SIZE = 10 * 1024 * 1024  # 10 MB per file
+    MAX_LOG_FILE_SIZE = settings.OUTPUT_LOG_MAX_SIZE_BYTES  # 2 MB per instance output.log
     LOG_RETENTION_DAYS = 7  # Keep logs for 7 days
     CHECK_INTERVAL_HOURS = 24  # Run cleanup every 24 hours
+
+    @staticmethod
+    def trim_log_file_to_size(log_file: Path, max_size_bytes: int = MAX_LOG_FILE_SIZE) -> bool:
+        """
+        Trim a log file in-place to max_size_bytes by removing old bytes from the beginning.
+
+        Keeps the newest content and tries to cut at the next newline boundary to avoid
+        starting with a partial line.
+        """
+        if not log_file.exists() or max_size_bytes <= 0:
+            return False
+
+        file_size = log_file.stat().st_size
+        if file_size <= max_size_bytes:
+            return False
+
+        keep_from = file_size - max_size_bytes
+
+        with open(log_file, "rb+") as f:
+            f.seek(keep_from)
+            data = f.read()
+
+            newline_idx = data.find(b"\n")
+            if 0 <= newline_idx < len(data) - 1:
+                data = data[newline_idx + 1:]
+
+            f.seek(0)
+            f.write(data)
+            f.truncate()
+
+        return True
 
     @staticmethod
     def cleanup_old_logs(max_age_days: int = LOG_RETENTION_DAYS):
@@ -73,8 +104,7 @@ class LogCleanupManager:
     @staticmethod
     def rotate_large_logs(max_size_bytes: int = MAX_LOG_FILE_SIZE):
         """
-        Rotate log files that exceed max_size_bytes.
-        Renames old log to .1, .2, etc. and creates fresh log.
+        Trim miner log files in-place to max_size_bytes.
         
         Args:
             max_size_bytes: Rotate logs larger than this size (default: 10 MB)
@@ -82,7 +112,7 @@ class LogCleanupManager:
         if not settings.INSTANCES_DIR.exists():
             return
 
-        rotated_count = 0
+        trimmed_count = 0
 
         for instance_dir in settings.INSTANCES_DIR.iterdir():
             if not instance_dir.is_dir():
@@ -92,31 +122,19 @@ class LogCleanupManager:
             if not logs_dir.exists():
                 continue
 
-            # Only rotate primary log file, not already-rotated ones (.1.log, .2.log, etc.)
-            log_file = logs_dir / "output.log"
-            if log_file.exists():
+            for log_file in logs_dir.glob("*.log"):
                 try:
-                    file_size = log_file.stat().st_size
-
-                    if file_size > max_size_bytes:
-                        # Find next available rotation number
-                        rotation_num = 1
-                        while (logs_dir / f"output.{rotation_num}.log").exists():
-                            rotation_num += 1
-
-                        rotated_file = logs_dir / f"output.{rotation_num}.log"
-                        log_file.rename(rotated_file)
-                        rotated_count += 1
-
+                    if LogCleanupManager.trim_log_file_to_size(log_file, max_size_bytes=max_size_bytes):
+                        trimmed_count += 1
                         logger.info(
-                            f"Rotated log: {log_file.name} -> {rotated_file.name} "
-                            f"(size: {file_size / 1024 / 1024:.1f} MB)"
+                            f"Trimmed log in place: {log_file.name} "
+                            f"(max: {max_size_bytes / 1024 / 1024:.1f} MB)"
                         )
                 except Exception as e:
-                    logger.error(f"Error rotating log file {log_file}: {e}")
+                    logger.error(f"Error trimming log file {log_file}: {e}")
 
-        if rotated_count > 0:
-            logger.info(f"Log rotation complete: Rotated {rotated_count} files")
+        if trimmed_count > 0:
+            logger.info(f"Log maintenance complete: trimmed={trimmed_count}")
 
     @classmethod
     async def cleanup_task(cls):

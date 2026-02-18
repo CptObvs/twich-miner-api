@@ -2,37 +2,35 @@
 Twitch Miner Backend API
 ========================
 FastAPI application for managing multiple Twitch Channel Points Miner instances.
-
-Features:
-- Multi-user support with JWT authentication
-- Instance management (start/stop/configure)
-- Real-time log streaming via SSE
-- OAuth2 Password Flow for authentication
 """
 
+import asyncio
+import gc
+import io
 import logging
 import sys
-import io
+from time import perf_counter
 from contextlib import asynccontextmanager
-
-# Enable UTF-8 encoding for Windows console (skip during test runs)
-if sys.platform == "win32" and "pytest" not in sys.modules:
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
-    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
-
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 
 from alembic import command
 from alembic.config import Config
+from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from jose import JWTError, jwt
 
 from app.core.config import settings
-from app.routers import auth, admin, codes, instances
-from app.services.miner_manager import miner_manager
+from app.routers import admin, auth, codes, instances
 from app.services.log_cleanup import log_cleanup
+from app.services.miner_manager import miner_manager
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("uvicorn.error")
+request_logger = logging.getLogger("uvicorn.error")
+
+
+if sys.platform == "win32" and "pytest" not in sys.modules:
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 
 
 def run_migrations() -> None:
@@ -42,100 +40,108 @@ def run_migrations() -> None:
     logger.info("Database migrations applied successfully")
 
 
+async def orphan_process_cleanup() -> None:
+    while True:
+        await asyncio.sleep(300)
+        await miner_manager.cleanup_orphan_processes()
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager."""
-    run_migrations()
-    await miner_manager.reset_all_on_startup()
+
+async def memory_gc_cleanup() -> None:
+    while True:
+        await asyncio.sleep(settings.MEMORY_GC_INTERVAL_SECONDS)
+        collected = gc.collect(settings.MEMORY_GC_GENERATION)
+        logger.debug(f"Periodic GC run complete, collected objects: {collected}")
+
+
+def start_background_tasks(app: FastAPI) -> None:
+    app.state.cleanup_task = asyncio.create_task(orphan_process_cleanup())
+    app.state.memory_gc_task = (
+        asyncio.create_task(memory_gc_cleanup()) if settings.MEMORY_GC_ENABLED else None
+    )
+
+
+async def stop_background_tasks(app: FastAPI) -> None:
+    tasks = []
+    for attr in ("cleanup_task", "memory_gc_task"):
+        task = getattr(app.state, attr, None)
+        if task:
+            task.cancel()
+            tasks.append(task)
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def run_startup(app: FastAPI) -> None:
+    logger.info("Starte API ...")
+    if settings.RUN_MIGRATIONS_ON_STARTUP:
+        run_migrations()
+    else:
+        logger.info("Überspringe Migrationen beim Startup (RUN_MIGRATIONS_ON_STARTUP=false)")
+    await miner_manager.reconcile_all_on_startup()
     log_cleanup.rotate_large_logs()
     log_cleanup.cleanup_old_logs()
     log_cleanup.start_cleanup_task()
+    start_background_tasks(app)
+    logger.info("API startup abgeschlossen")
 
-    # Signal-Handler für sauberes Beenden (Linux/Unix)
-    def force_kill_all(*_):
-        for proc in list(miner_manager._processes.values()):
-            try:
-                if hasattr(proc, 'pid'):
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            except Exception:
-                pass
-        os._exit(1)
 
-    if sys.platform != "win32":
-        loop = asyncio.get_event_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, force_kill_all)
-            except NotImplementedError:
-                pass
+async def run_shutdown(app: FastAPI) -> None:
+    logger.info("Stopping API ...")
+    await stop_background_tasks(app)
+    await miner_manager.shutdown_all()
+    logger.info("API stopped cleanly")
 
-    # Starte Hintergrund-Task zur Überprüfung auf verwaiste Prozesse
-    async def orphan_process_cleanup():
-        while True:
-            await asyncio.sleep(300)  # alle 5 Minuten
-            await miner_manager.cleanup_orphan_processes()
 
-    cleanup_task = asyncio.create_task(orphan_process_cleanup())
+def _extract_request_identity(request: Request) -> tuple[str | None, str | None]:
+    auth_header = request.headers.get("authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None, None
 
+    token = auth_header.split(" ", 1)[1].strip()
+    if not token:
+        return None, None
+
+    try:
+        payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+        return payload.get("sub"), payload.get("username")
+    except JWTError:
+        return None, None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await run_startup(app)
     try:
         yield
     finally:
-        cleanup_task.cancel()
-        await miner_manager.shutdown_all()
-
+        await run_shutdown(app)
 
 
 app = FastAPI(
     title="Twitch Miner Backend",
     description="Manage Twitch Channel Points Miner instances via REST API + SSE log streaming",
     version="1.0.0",
-    root_path="/api",  # Behind reverse proxy at /api
+    root_path="/api",
     docs_url=settings.DOCS_URL if settings.ENABLE_SWAGGER else None,
     redoc_url=settings.REDOC_URL if settings.ENABLE_SWAGGER else None,
     openapi_url="/openapi.json" if settings.ENABLE_SWAGGER else None,
     swagger_ui_parameters={
         "persistAuthorization": True,
-        "syntaxHighlight.theme": "monokai",  # Dark theme
+        "syntaxHighlight.theme": "monokai",
         "displayRequestDuration": True,
         "filter": True,
         "tryItOutEnabled": True,
     },
+    lifespan=lifespan,
 )
 
-# Startup/Shutdown-Events statt lifespan
-@app.on_event("startup")
-async def on_startup():
-    run_migrations()
-    await miner_manager.reset_all_on_startup()
-    log_cleanup.rotate_large_logs()
-    log_cleanup.cleanup_old_logs()
-    log_cleanup.start_cleanup_task()
-    # orphan_process_cleanup nur im Hauptprozess (kein Fork/Worker)
-    import os
-    if os.getpid() == os.getppid():
-        app.state.cleanup_task = asyncio.create_task(orphan_process_cleanup())
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    cleanup_task = getattr(app.state, "cleanup_task", None)
-    if cleanup_task:
-        cleanup_task.cancel()
-    await miner_manager.shutdown_all()
-
-# orphan_process_cleanup als eigenständige Funktion
-async def orphan_process_cleanup():
-    while True:
-        await asyncio.sleep(300)
-        await miner_manager.cleanup_orphan_processes()
-
-# Trust headers from reverse proxy
 app.add_middleware(
     TrustedHostMiddleware,
-    allowed_hosts=["*"], 
+    allowed_hosts=["*"],
 )
 
-# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
@@ -144,7 +150,44 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# API routers (served under /api by reverse proxy)
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    if not settings.API_REQUEST_LOGGING_ENABLED:
+        return await call_next(request)
+
+    start = perf_counter()
+    client_ip = request.client.host if request.client else "-"
+    user_id, username = _extract_request_identity(request)
+    actor = username or user_id or "anonymous"
+    method = request.method
+    path = request.url.path
+
+    try:
+        response = await call_next(request)
+        duration_ms = (perf_counter() - start) * 1000
+        request_logger.info(
+            "API %s %s abgeschlossen: Status %s in %.2f ms (Nutzer: %s, IP: %s)",
+            method,
+            path,
+            response.status_code,
+            duration_ms,
+            actor,
+            client_ip,
+        )
+        return response
+    except Exception:
+        duration_ms = (perf_counter() - start) * 1000
+        request_logger.exception(
+            "API %s %s fehlgeschlagen: Status 500 nach %.2f ms (Nutzer: %s, IP: %s)",
+            method,
+            path,
+            duration_ms,
+            actor,
+            client_ip,
+        )
+        raise
+
 app.include_router(auth.router)
 app.include_router(admin.router)
 app.include_router(codes.router)
@@ -153,7 +196,6 @@ app.include_router(instances.router)
 
 @app.get("/", tags=["health"])
 async def root():
-    """Root endpoint."""
     return {
         "status": "ok",
         "service": "Twitch Miner Backend",
@@ -164,5 +206,4 @@ async def root():
 
 @app.get("/health", tags=["health"])
 async def health():
-    """Health check endpoint."""
     return {"status": "healthy"}

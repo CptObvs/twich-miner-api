@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 from datetime import datetime
 from app.models.enums import UserRole, InstanceState
 
@@ -27,8 +27,7 @@ class UserResponse(BaseModel):
     created_at: datetime
     max_invite_codes: int = 2
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class UpdateUserRoleRequest(BaseModel):
@@ -51,8 +50,7 @@ class RegistrationCodeResponse(BaseModel):
     created_at: datetime
     expires_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class RegistrationCodeDetailResponse(BaseModel):
@@ -65,8 +63,7 @@ class RegistrationCodeDetailResponse(BaseModel):
     created_by_username: str | None = None
     is_valid: bool
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class UpdateInviteLimitRequest(BaseModel):
@@ -77,7 +74,7 @@ class UpdateInviteLimitRequest(BaseModel):
 
 class InstanceCreate(BaseModel):
     twitch_username: str
-    streamers: list[str] = []
+    streamers: list[str] = Field(default_factory=list)
 
 
 class StreamersUpdate(BaseModel):
@@ -90,15 +87,14 @@ class InstanceResponse(BaseModel):
     twitch_username: str
     status: InstanceState
     pid: int | None = None
-    streamers: list[str] = []
+    streamers: list[str] = Field(default_factory=list)
     created_at: datetime
     last_started_at: datetime | None = None
     last_stopped_at: datetime | None = None
     activation_url: str | None = None
     activation_code: str | None = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class InstanceStatus(BaseModel):

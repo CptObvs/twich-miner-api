@@ -8,9 +8,9 @@ Each miner instance runs as a separate Python subprocess with its own:
 """
 
 import asyncio
+import logging
 import os
 import signal
-import logging
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,36 +30,56 @@ class MinerProcessManager:
     """Singleton that tracks all running miner subprocesses."""
 
     async def cleanup_orphan_processes(self):
-        """
-        Entfernt verwaiste Prozesse aus dem Tracking, die nicht mehr laufen.
-        """
+        """Clean local process/watch task caches and reconcile DB process states."""
         to_remove = []
         for instance_id, proc in self._processes.items():
             if proc.returncode is not None:
                 to_remove.append(instance_id)
             else:
-                # Prüfe, ob der Prozess noch existiert
                 try:
                     os.kill(proc.pid, 0)
                 except OSError:
                     to_remove.append(instance_id)
         for instance_id in to_remove:
-            logger.info(f"Entferne verwaisten Prozess aus Tracking: {instance_id}")
+            logger.info(f"Removing orphaned tracked process: {instance_id}")
             self._processes.pop(instance_id, None)
-            self._pipe_tasks.pop(instance_id, None)
-            self._stopped_by_request.discard(instance_id)
+            self._watch_tasks.pop(instance_id, None)
+
+        await self.reconcile_all_on_startup()
 
     def __init__(self):
-        # instance_id -> asyncio.subprocess.Process
         self._processes: dict[str, asyncio.subprocess.Process] = {}
-        # instance_id -> asyncio.Task for _pipe_output
-        self._pipe_tasks: dict[str, asyncio.Task] = {}
-        # Tracks which instances were stopped explicitly (to avoid race with _pipe_output)
-        self._stopped_by_request: set[str] = set()
+        self._watch_tasks: dict[str, asyncio.Task] = {}
 
-    # ------------------------------------------------------------------
-    # Generate run.py for a miner instance
-    # ------------------------------------------------------------------
+    @staticmethod
+    def _pid_exists(pid: int | None) -> bool:
+        if pid is None or pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    @staticmethod
+    def _signal_process(pid: int, sig: signal.Signals) -> None:
+        if os.name == "nt":
+            os.kill(pid, sig)
+            return
+        os.killpg(os.getpgid(pid), sig)
+
+    async def _wait_for_pid_exit(self, pid: int, timeout_seconds: int) -> bool:
+        deadline = asyncio.get_event_loop().time() + timeout_seconds
+        while asyncio.get_event_loop().time() < deadline:
+            if not self._pid_exists(pid):
+                return True
+            await asyncio.sleep(0.2)
+        return not self._pid_exists(pid)
+
     def _generate_run_script(
         self,
         instance_dir: Path,
@@ -69,11 +89,9 @@ class MinerProcessManager:
         """Create a run.py based on the official example.py with sensible defaults."""
         streamer_lines = "\n".join(f'        "{s}",' for s in streamers)
 
-        # Add MINER_REPO_PATH to sys.path if configured
         miner_repo_path = settings.MINER_REPO_PATH
         sys_path_insert = ""
         if miner_repo_path:
-            # Expand ~ to home directory
             expanded_path = str(Path(miner_repo_path).expanduser())
             sys_path_insert = (
                 f'import sys\n'
@@ -158,9 +176,6 @@ class MinerProcessManager:
         run_path.write_text(script)
         return run_path
 
-    # ------------------------------------------------------------------
-    # Instance directory setup
-    # ------------------------------------------------------------------
     def _ensure_instance_dir(self, instance_id: str) -> Path:
         """Create and return the instance's data directory."""
         instance_dir = settings.INSTANCES_DIR / instance_id
@@ -169,125 +184,218 @@ class MinerProcessManager:
         (instance_dir / "analytics").mkdir(parents=True, exist_ok=True)
         return instance_dir
 
-    # ------------------------------------------------------------------
-    # Kill process tree
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _kill_process_tree(pid: int) -> None:
-        """Kill a process and all its children via SIGKILL to the process group."""
-        try:
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError, OSError) as e:
-            logger.debug(f"Process tree kill for PID {pid}: {e}")
+    async def _update_instance_status(
+        self,
+        instance_id: str,
+        *,
+        status: InstanceState,
+        pid: int | None = None,
+        set_last_started_at: bool = False,
+        set_last_stopped_at: bool = False,
+        db_session: AsyncSession | None = None,
+    ) -> None:
+        if db_session is not None:
+            result = await db_session.execute(
+                select(MinerInstance).where(MinerInstance.id == instance_id)
+            )
+            inst = result.scalar_one_or_none()
+            if not inst:
+                return
 
-    # ------------------------------------------------------------------
-    # Start a miner
-    # ------------------------------------------------------------------
+            inst.status = status
+            inst.pid = pid
+            if set_last_started_at:
+                inst.last_started_at = datetime.now(timezone.utc)
+            if set_last_stopped_at:
+                inst.last_stopped_at = datetime.now(timezone.utc)
+            await db_session.commit()
+            return
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(MinerInstance).where(MinerInstance.id == instance_id)
+            )
+            inst = result.scalar_one_or_none()
+            if not inst:
+                return
+
+            inst.status = status
+            inst.pid = pid
+            if set_last_started_at:
+                inst.last_started_at = datetime.now(timezone.utc)
+            if set_last_stopped_at:
+                inst.last_stopped_at = datetime.now(timezone.utc)
+            await db.commit()
+
+    async def _reserve_instance_start(self, instance_id: str, db_session: AsyncSession | None = None) -> bool:
+        """Atomically reserve instance startup to prevent concurrent starts across workers."""
+        if db_session is not None:
+            result = await db_session.execute(
+                update(MinerInstance)
+                .where(
+                    MinerInstance.id == instance_id,
+                    MinerInstance.status == InstanceState.STOPPED,
+                )
+                .values(
+                    status=InstanceState.RUNNING,
+                    pid=0,
+                    last_started_at=datetime.now(timezone.utc),
+                )
+            )
+            await db_session.commit()
+            return (result.rowcount or 0) == 1
+
+        async with async_session() as db:
+            result = await db.execute(
+                update(MinerInstance)
+                .where(
+                    MinerInstance.id == instance_id,
+                    MinerInstance.status == InstanceState.STOPPED,
+                )
+                .values(
+                    status=InstanceState.RUNNING,
+                    pid=0,
+                    last_started_at=datetime.now(timezone.utc),
+                )
+            )
+            await db.commit()
+            return (result.rowcount or 0) == 1
+
+    async def reconcile_instance_status(self, instance_id: str, db_session: AsyncSession | None = None) -> None:
+        """Synchronize a DB instance state with real process existence."""
+        if db_session is not None:
+            result = await db_session.execute(
+                select(MinerInstance).where(MinerInstance.id == instance_id)
+            )
+            inst = result.scalar_one_or_none()
+            if not inst:
+                return
+
+            if inst.status != InstanceState.RUNNING:
+                return
+
+            if not self._pid_exists(inst.pid):
+                inst.status = InstanceState.STOPPED
+                inst.pid = None
+                inst.last_stopped_at = datetime.now(timezone.utc)
+                await db_session.commit()
+            return
+
+        async with async_session() as db:
+            result = await db.execute(
+                select(MinerInstance).where(MinerInstance.id == instance_id)
+            )
+            inst = result.scalar_one_or_none()
+            if not inst:
+                return
+
+            if inst.status != InstanceState.RUNNING:
+                return
+
+            if not self._pid_exists(inst.pid):
+                inst.status = InstanceState.STOPPED
+                inst.pid = None
+                inst.last_stopped_at = datetime.now(timezone.utc)
+                await db.commit()
+
+    async def reconcile_all_on_startup(self):
+        """Mark stale non-stopped instances as STOPPED if their OS process is gone."""
+        async with async_session() as db:
+            result = await db.execute(
+                select(MinerInstance).where(MinerInstance.status != InstanceState.STOPPED)
+            )
+            instances = result.scalars().all()
+
+            changed = 0
+            for inst in instances:
+                if not self._pid_exists(inst.pid):
+                    inst.status = InstanceState.STOPPED
+                    inst.pid = None
+                    inst.last_stopped_at = datetime.now(timezone.utc)
+                    changed += 1
+
+            if changed > 0:
+                await db.commit()
+                logger.info(f"Reconciled {changed} stale instance(s) to STOPPED")
+
     async def start(
         self,
         instance_id: str,
         twitch_username: str,
         streamers: list[str],
+        db_session: AsyncSession | None = None,
     ) -> int:
         """
         Start the miner subprocess. Returns the OS PID.
         Raises RuntimeError if already running.
         """
-        if instance_id in self._processes:
-            proc = self._processes[instance_id]
-            if proc.returncode is None:
-                raise RuntimeError(f"Instance {instance_id} is already running (PID {proc.pid})")
+        reserved = await self._reserve_instance_start(instance_id, db_session=db_session)
+        if not reserved:
+            raise RuntimeError(f"Instance {instance_id} is already running or transitioning")
 
         instance_dir = self._ensure_instance_dir(instance_id)
         run_script = self._generate_run_script(
             instance_dir, twitch_username, streamers
         )
 
-        # Start subprocess in the instance's directory
-        # The miner writes cookies/logs relative to cwd
-        # Set PYTHONIOENCODING to UTF-8 to handle emoji output on Windows
-        # Use sys.executable to ensure we use the same Python interpreter (from venv)
         env = {**os.environ, "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"}
-
-        # Use start_new_session so we can kill the entire process group via killpg
         kwargs = {"start_new_session": True}
 
-        process = await asyncio.create_subprocess_exec(
-            sys.executable, str(run_script),
-            cwd=str(instance_dir),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=env,
-            **kwargs,
-        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, str(run_script),
+                cwd=str(instance_dir),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                env=env,
+                **kwargs,
+            )
+        except Exception:
+            await self._update_instance_status(
+                instance_id,
+                status=InstanceState.STOPPED,
+                pid=None,
+                db_session=db_session,
+            )
+            raise
 
         self._processes[instance_id] = process
-        self._stopped_by_request.discard(instance_id)
         logger.info(f"Started miner instance {instance_id} with PID {process.pid}")
 
-        # Pipe stdout to a combined log file (tracked so stop() can await completion)
-        task = asyncio.create_task(self._pipe_output(instance_id, instance_dir, process))
-        self._pipe_tasks[instance_id] = task
+        task = asyncio.create_task(self._watch_process(instance_id, process))
+        self._watch_tasks[instance_id] = task
 
-        # Update DB
-        async with async_session() as db:
-            result = await db.execute(
-                select(MinerInstance).where(MinerInstance.id == instance_id)
-            )
-            inst = result.scalar_one_or_none()
-            if inst:
-                inst.status = InstanceState.RUNNING
-                inst.pid = process.pid
-                inst.last_started_at = datetime.now(timezone.utc)
-                await db.commit()
+        await self._update_instance_status(
+            instance_id,
+            status=InstanceState.RUNNING,
+            pid=process.pid,
+            db_session=db_session,
+        )
 
         return process.pid
 
-    # ------------------------------------------------------------------
-    # Pipe subprocess output to log file
-    # ------------------------------------------------------------------
-    async def _pipe_output(
+    async def _watch_process(
         self,
         instance_id: str,
-        instance_dir: Path,
         process: asyncio.subprocess.Process,
     ):
-        """Read stdout line by line and write to a combined log file."""
-        log_file = instance_dir / "logs" / "output.log"
+        """Wait for process exit and synchronize in-memory/DB state."""
         try:
-            with open(log_file, "a", encoding="utf-8") as f:
-                async for line in process.stdout:
-                    decoded = line.decode("utf-8", errors="replace")
-                    f.write(decoded)
-                    f.flush()
-        except Exception as e:
-            logger.error(f"Error piping output for {instance_id}: {e}")
-        finally:
             await process.wait()
             logger.info(f"Miner instance {instance_id} exited with code {process.returncode}")
             self._processes.pop(instance_id, None)
-            self._pipe_tasks.pop(instance_id, None)
+            self._watch_tasks.pop(instance_id, None)
 
-            # Only update DB if stop() didn't already handle it
-            if instance_id in self._stopped_by_request:
-                self._stopped_by_request.discard(instance_id)
-                return
+            await self._update_instance_status(
+                instance_id,
+                status=InstanceState.STOPPED,
+                pid=None,
+                set_last_stopped_at=True,
+            )
+        except Exception as e:
+            logger.error(f"Error watching process for {instance_id}: {e}")
 
-            async with async_session() as db:
-                result = await db.execute(
-                    select(MinerInstance).where(MinerInstance.id == instance_id)
-                )
-                inst = result.scalar_one_or_none()
-                if inst:
-                    inst.status = InstanceState.STOPPED
-                    inst.pid = None
-                    inst.last_stopped_at = datetime.now(timezone.utc)
-                    await db.commit()
-
-    # ------------------------------------------------------------------
-    # Stop a miner
-    # ------------------------------------------------------------------
-    async def stop(self, instance_id: str) -> bool:
+    async def stop(self, instance_id: str, db_session: AsyncSession | None = None) -> bool:
         """
         Gracefully stop a miner and wait until the process has fully exited.
 
@@ -304,116 +412,102 @@ class MinerProcessManager:
         GRACEFUL_TIMEOUT = 30  # seconds to wait for graceful shutdown
         FORCE_TIMEOUT = 10    # seconds to wait after force-kill
 
-        proc = self._processes.get(instance_id)
-        if proc is None or proc.returncode is not None:
-            # Clean up stale entry
-            self._processes.pop(instance_id, None)
-            return False
-
-        pid = proc.pid
-        logger.info(f"Stopping miner instance {instance_id} (PID {pid})")
-
-        # Mark as stopped by request so _pipe_output skips DB update
-        self._stopped_by_request.add(instance_id)
-
-        # --- 0. Set STOPPING in DB immediately --------------------------
-        async with async_session() as db:
-            result = await db.execute(
+        if db_session is not None:
+            result = await db_session.execute(
                 select(MinerInstance).where(MinerInstance.id == instance_id)
             )
             inst = result.scalar_one_or_none()
-            if inst:
-                inst.status = InstanceState.STOPPING
-                await db.commit()
+            if not inst or inst.status == InstanceState.STOPPED or not self._pid_exists(inst.pid):
+                if inst and inst.status != InstanceState.STOPPED:
+                    inst.status = InstanceState.STOPPED
+                    inst.pid = None
+                    inst.last_stopped_at = datetime.now(timezone.utc)
+                    await db_session.commit()
+                return False
+            pid = inst.pid
+        else:
+            async with async_session() as db:
+                result = await db.execute(
+                    select(MinerInstance).where(MinerInstance.id == instance_id)
+                )
+                inst = result.scalar_one_or_none()
+                if not inst or inst.status == InstanceState.STOPPED or not self._pid_exists(inst.pid):
+                    if inst and inst.status != InstanceState.STOPPED:
+                        inst.status = InstanceState.STOPPED
+                        inst.pid = None
+                        inst.last_stopped_at = datetime.now(timezone.utc)
+                        await db.commit()
+                    return False
+                pid = inst.pid
 
-        # --- 1. Graceful SIGTERM to the process group -------------------
+        logger.info(f"Stopping miner instance {instance_id} (PID {pid})")
+
+        await self._update_instance_status(
+            instance_id,
+            status=InstanceState.STOPPING,
+            pid=pid,
+            db_session=db_session,
+        )
+
         try:
-            os.killpg(os.getpgid(pid), signal.SIGTERM)
+            self._signal_process(pid, signal.SIGTERM)
         except (ProcessLookupError, PermissionError, OSError) as e:
             logger.debug(f"Graceful signal for PID {pid}: {e}")
 
-        # --- 2. Wait for graceful exit ----------------------------------
+        local_proc = self._processes.get(instance_id)
         try:
-            await asyncio.wait_for(proc.wait(), timeout=GRACEFUL_TIMEOUT)
+            if local_proc and local_proc.returncode is None:
+                await asyncio.wait_for(local_proc.wait(), timeout=GRACEFUL_TIMEOUT)
+            else:
+                exited = await self._wait_for_pid_exit(pid, GRACEFUL_TIMEOUT)
+                if not exited:
+                    raise asyncio.TimeoutError
             logger.info(
-                f"Instance {instance_id} (PID {pid}) exited gracefully "
-                f"with code {proc.returncode}"
+                f"Instance {instance_id} (PID {pid}) exited gracefully"
             )
         except asyncio.TimeoutError:
-            # --- 3. Force-kill -------------------------------------------
             logger.warning(
                 f"Graceful stop timed out after {GRACEFUL_TIMEOUT}s for "
                 f"instance {instance_id} (PID {pid}), force-killing"
             )
-            self._kill_process_tree(pid)
             try:
-                await asyncio.wait_for(proc.wait(), timeout=FORCE_TIMEOUT)
-            except asyncio.TimeoutError:
-                logger.warning(f"Force-killing main process {pid}")
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
+                self._signal_process(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                pass
 
-        # --- 4. Wait for _pipe_output task to finish --------------------
-        pipe_task = self._pipe_tasks.get(instance_id)
-        if pipe_task and not pipe_task.done():
             try:
-                await asyncio.wait_for(pipe_task, timeout=5)
+                if local_proc and local_proc.returncode is None:
+                    await asyncio.wait_for(local_proc.wait(), timeout=FORCE_TIMEOUT)
+                else:
+                    await self._wait_for_pid_exit(pid, FORCE_TIMEOUT)
+            except (asyncio.TimeoutError, ProcessLookupError):
+                pass
+
+        watch_task = self._watch_tasks.get(instance_id)
+        if watch_task and not watch_task.done():
+            try:
+                await asyncio.wait_for(watch_task, timeout=5)
             except (asyncio.TimeoutError, asyncio.CancelledError):
-                pipe_task.cancel()
+                watch_task.cancel()
 
         self._processes.pop(instance_id, None)
-        self._pipe_tasks.pop(instance_id, None)
+        self._watch_tasks.pop(instance_id, None)
 
-        # --- 5. Set STOPPED in DB ---------------------------------------
-        async with async_session() as db:
-            result = await db.execute(
-                select(MinerInstance).where(MinerInstance.id == instance_id)
-            )
-            inst = result.scalar_one_or_none()
-            if inst:
-                inst.status = InstanceState.STOPPED
-                inst.pid = None
-                inst.last_stopped_at = datetime.now(timezone.utc)
-                await db.commit()
+        await self._update_instance_status(
+            instance_id,
+            status=InstanceState.STOPPED,
+            pid=None,
+            set_last_stopped_at=True,
+            db_session=db_session,
+        )
 
         return True
 
-    # ------------------------------------------------------------------
-    # Status check (in-memory only, used for start/stop guards)
-    # ------------------------------------------------------------------
     def is_process_tracked(self, instance_id: str) -> bool:
-        """Check if we have a live process object for this instance."""
+        """Backward-compatible helper used by tests and same-worker guards."""
         proc = self._processes.get(instance_id)
         return proc is not None and proc.returncode is None
 
-    def get_pid(self, instance_id: str) -> int | None:
-        proc = self._processes.get(instance_id)
-        if proc and proc.returncode is None:
-            return proc.pid
-        return None
-
-    # ------------------------------------------------------------------
-    # Startup: reset all DB flags to false
-    # ------------------------------------------------------------------
-    @staticmethod
-    async def reset_all_on_startup():
-        """Reset all instances to STOPPED on API startup."""
-        async with async_session() as db:
-            result = await db.execute(
-                update(MinerInstance)
-                .where(MinerInstance.status != InstanceState.STOPPED)
-                .values(status=InstanceState.STOPPED, pid=None)
-            )
-            if result.rowcount > 0:
-                logger.info(f"Reset {result.rowcount} instance(s) to STOPPED on startup")
-            await db.commit()
-
-    # ------------------------------------------------------------------
-    # Cleanup on shutdown
-    # ------------------------------------------------------------------
     async def shutdown_all(self):
         """Stop all running miners (called on app shutdown)."""
         for instance_id in list(self._processes.keys()):
