@@ -103,3 +103,13 @@ class InstanceStatus(BaseModel):
     pid: int | None = None
     activation_url: str | None = None
     activation_code: str | None = None
+
+
+class StreamerPointsSnapshot(BaseModel):
+    streamer: str
+    channel_points: str
+
+
+class InstancePointsSnapshotResponse(BaseModel):
+    instance_id: str
+    streamers: list[StreamerPointsSnapshot] = Field(default_factory=list)

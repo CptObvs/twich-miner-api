@@ -12,10 +12,18 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import settings
 from app.models.database import User, MinerInstance, get_db
 from app.models.enums import InstanceState
-from app.models.schemas import InstanceCreate, InstanceResponse, InstanceStatus, StreamersUpdate
+from app.models.schemas import (
+    InstanceCreate,
+    InstancePointsSnapshotResponse,
+    InstanceResponse,
+    InstanceStatus,
+    StreamerPointsSnapshot,
+    StreamersUpdate,
+)
 from app.services.auth import get_current_user
 from app.services.miner_manager import miner_manager
 from app.services.log_streamer import tail_log, get_instance_log_file
+from app.services.points_snapshot import get_instance_points_snapshot
 
 router = APIRouter(prefix="/instances", tags=["instances"])
 logger = logging.getLogger("uvicorn.error")
@@ -161,6 +169,63 @@ async def list_instances(
             select(MinerInstance).where(MinerInstance.user_id == current_user.id)
         )
     return [_instance_to_response(inst) for inst in result.scalars().all()]
+
+
+@router.get("/points-snapshot", response_model=list[InstancePointsSnapshotResponse])
+async def get_points_snapshot(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    history_lines: int = Query(
+        2000,
+        ge=100,
+        le=20000,
+        description="How many recent log lines are scanned per instance",
+    ),
+    refresh: bool = Query(False, description="Force rescan and bypass cache"),
+):
+    if current_user.is_admin():
+        result = await db.execute(select(MinerInstance))
+    else:
+        result = await db.execute(
+            select(MinerInstance).where(MinerInstance.user_id == current_user.id)
+        )
+
+    snapshots: list[InstancePointsSnapshotResponse] = []
+    for instance in result.scalars().all():
+        configured_streamers: list[str] = []
+        try:
+            config = _read_config(instance.id)
+            configured_streamers = [str(name).strip() for name in config.get("streamers", [])]
+        except Exception:
+            configured_streamers = []
+
+        points_by_streamer = get_instance_points_snapshot(
+            instance.id,
+            history_lines=history_lines,
+            refresh=refresh,
+            expected_streamers=set(configured_streamers) if configured_streamers else None,
+        )
+
+        ordered_streamers: list[StreamerPointsSnapshot] = []
+        seen: set[str] = set()
+        for streamer_name in configured_streamers:
+            key = streamer_name.lower()
+            if key in points_by_streamer:
+                ordered_streamers.append(
+                    StreamerPointsSnapshot(streamer=streamer_name, channel_points=points_by_streamer[key])
+                )
+                seen.add(key)
+
+        for name, points in sorted(points_by_streamer.items()):
+            if name in seen:
+                continue
+            ordered_streamers.append(StreamerPointsSnapshot(streamer=name, channel_points=points))
+
+        snapshots.append(
+            InstancePointsSnapshotResponse(instance_id=instance.id, streamers=ordered_streamers)
+        )
+
+    return snapshots
 
 
 @router.get("/{instance_id}", response_model=InstanceResponse)
