@@ -75,6 +75,27 @@ class MinerInstance(Base):
     user: Mapped["User"] = relationship(back_populates="instances")
 
 
+class BannedIP(Base):
+    __tablename__ = "banned_ips"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    ip_address: Mapped[str] = mapped_column(String, nullable=False, unique=True)
+    banned_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: datetime.now(timezone.utc))
+    banned_until: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    hit_count: Mapped[int] = mapped_column(Integer, nullable=False, default=10)
+
+
+class ConnectedIP(Base):
+    __tablename__ = "connected_ips"
+
+    ip_address: Mapped[str] = mapped_column(String, primary_key=True)
+    country: Mapped[str | None] = mapped_column(String, nullable=True)
+    country_code: Mapped[str | None] = mapped_column(String, nullable=True)
+    first_seen: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    last_seen: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    request_count: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+
+
 # --- Database engine / session ---
 
 engine = create_async_engine("sqlite+aiosqlite:///data/app.db", echo=False)

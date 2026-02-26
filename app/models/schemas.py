@@ -122,3 +122,28 @@ class StreamersUpdate(BaseModel):
 class StreamerPointsSnapshot(BaseModel):
     streamer: str
     channel_points: str | None
+
+
+class ManualBanRequest(BaseModel):
+    ip_address: str
+    duration_hours: int = 24
+
+
+class BannedIPResponse(BaseModel):
+    ip_address: str
+    banned_at: datetime
+    banned_until: datetime
+    hit_count: int
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class ConnectedIPResponse(BaseModel):
+    ip_address: str
+    country: str | None
+    country_code: str | None
+    first_seen: datetime
+    last_seen: datetime
+    request_count: int
+
+    model_config = ConfigDict(from_attributes=True)

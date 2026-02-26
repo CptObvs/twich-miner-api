@@ -8,16 +8,15 @@ import asyncio
 import gc
 import io
 import logging
+import subprocess
 import sys
 from time import perf_counter
 from contextlib import asynccontextmanager
 
-from alembic.config import Config as AlembicConfig
-from alembic import command as alembic_command
-
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
+from fastapi.responses import JSONResponse
 from jose import JWTError, jwt
 
 import socketio as _socketio
@@ -27,6 +26,9 @@ from app.routers import admin, auth, codes, instances, proxy
 from app.services.miner_manager import miner_manager
 from app.routers.proxy import close_http_client
 from app.services.socket_manager import sio
+from app.services.ip_ban_service import ip_ban_service
+from app.services.ip_tracker_service import ip_tracker_service
+from app.models.database import async_session
 
 logger = logging.getLogger("uvicorn.error")
 request_logger = logging.getLogger("uvicorn.error")
@@ -50,8 +52,16 @@ async def memory_gc_cleanup() -> None:
         logger.debug(f"Periodic GC run complete, collected objects: {collected}")
 
 
+async def ip_tracker_flush_loop() -> None:
+    while True:
+        await asyncio.sleep(30)
+        async with async_session() as db:
+            await ip_tracker_service.flush(db)
+
+
 def start_background_tasks(app: FastAPI) -> None:
     app.state.cleanup_task = asyncio.create_task(orphan_container_cleanup())
+    app.state.ip_tracker_flush_task = asyncio.create_task(ip_tracker_flush_loop())
     app.state.memory_gc_task = (
         asyncio.create_task(memory_gc_cleanup()) if settings.MEMORY_GC_ENABLED else None
     )
@@ -59,7 +69,7 @@ def start_background_tasks(app: FastAPI) -> None:
 
 async def stop_background_tasks(app: FastAPI) -> None:
     tasks = []
-    for attr in ("cleanup_task", "memory_gc_task"):
+    for attr in ("cleanup_task", "ip_tracker_flush_task", "memory_gc_task"):
         task = getattr(app.state, attr, None)
         if task:
             task.cancel()
@@ -70,8 +80,15 @@ async def stop_background_tasks(app: FastAPI) -> None:
 
 
 def _run_migrations() -> None:
-    alembic_cfg = AlembicConfig("alembic.ini")
-    alembic_command.upgrade(alembic_cfg, "head")
+    result = subprocess.run(
+        [sys.executable, "-m", "alembic", "upgrade", "head"],
+        capture_output=True,
+        text=True,
+    )
+    for line in result.stdout.splitlines():
+        logger.info(line)
+    if result.returncode != 0:
+        raise RuntimeError(f"Migration failed:\n{result.stderr}")
 
 
 async def run_startup(app: FastAPI) -> None:
@@ -81,6 +98,9 @@ async def run_startup(app: FastAPI) -> None:
         await asyncio.to_thread(_run_migrations)
         logger.info("Database migrations complete")
     await miner_manager.reconcile_all_on_startup()
+    async with async_session() as db:
+        await ip_ban_service.load_from_db(db)
+        await ip_tracker_service.load_from_db(db)
     start_background_tasks(app)
     logger.info("API startup complete")
 
@@ -149,6 +169,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def ip_ban_middleware(request: Request, call_next):
+    ip = request.client.host if request.client else None
+
+    if ip:
+        if ip_ban_service.is_banned(ip):
+            return JSONResponse({"detail": "Forbidden"}, status_code=403)
+        ip_tracker_service.record(ip)
+
+    response = await call_next(request)
+
+    if ip and response.status_code == 404 and request.method != "OPTIONS":
+        async with async_session() as db:
+            await ip_ban_service.record_404(ip, db)
+
+    return response
 
 
 @app.middleware("http")

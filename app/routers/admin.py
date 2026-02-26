@@ -16,9 +16,14 @@ from app.models.schemas import (
     GenerateCodeRequest,
     RegistrationCodeResponse,
     RegistrationCodeDetailResponse,
+    BannedIPResponse,
+    ManualBanRequest,
+    ConnectedIPResponse,
 )
 from app.services.auth import get_current_user
 from app.services.registration import create_registration_code
+from app.services.ip_ban_service import ip_ban_service
+from app.services.ip_tracker_service import ip_tracker_service
 
 router = APIRouter(prefix="/admin", tags=["Admin"])
 
@@ -206,3 +211,96 @@ async def list_registration_codes(
         )
         for code in codes
     ]
+
+
+# --- IP Bans ---
+
+
+@router.get("/banned-ips", response_model=list[BannedIPResponse])
+async def list_banned_ips(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[BannedIPResponse]:
+    """
+    List all currently active IP bans.
+
+    Only ADMIN users can access this endpoint.
+    """
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can view banned IPs",
+        )
+
+    return await ip_ban_service.get_active_bans(db)
+
+
+@router.post("/banned-ips", status_code=201)
+async def ban_ip(
+    data: ManualBanRequest,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict:
+    """
+    Manually ban an IP for the given number of hours.
+
+    Only ADMIN users can access this endpoint.
+    """
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can ban IPs",
+        )
+
+    await ip_ban_service.ban(data.ip_address, data.duration_hours, db)
+    return {"detail": f"IP '{data.ip_address}' banned for {data.duration_hours}h"}
+
+
+@router.delete("/banned-ips/{ip}")
+async def unban_ip(
+    ip: str,
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict:
+    """
+    Remove an active IP ban.
+
+    Only ADMIN users can access this endpoint.
+    """
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can unban IPs",
+        )
+
+    removed = await ip_ban_service.unban(ip, db)
+    if not removed:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active ban found for IP '{ip}'",
+        )
+
+    return {"detail": f"IP '{ip}' has been unbanned"}
+
+
+# --- Connected IPs ---
+
+
+@router.get("/connected-ips", response_model=list[ConnectedIPResponse])
+async def list_connected_ips(
+    current_user: Annotated[User, Depends(get_current_user)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> list[ConnectedIPResponse]:
+    """
+    List all unique IPs that have ever connected, ordered by most recent activity.
+
+    Only ADMIN users can access this endpoint.
+    """
+    if not current_user.is_admin():
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admins can view connected IPs",
+        )
+
+    rows = await ip_tracker_service.get_all(db)
+    return [ConnectedIPResponse(**row) for row in rows]
